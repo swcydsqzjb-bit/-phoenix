@@ -129,16 +129,25 @@ def build_rows(symbol: str, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     if len(frame) < 12:
         return pd.DataFrame(), pd.DataFrame()
 
-    out = pd.DataFrame(index=frame.index)
+    # Add one synthetic future row. Its features are built from the latest
+    # three completed sessions, so the live scan truly predicts tomorrow.
+    synthetic_date = pd.Timestamp(frame.index.max()) + pd.offsets.BDay(1)
+    future_row = pd.DataFrame(
+        {column: [np.nan] for column in ["Open", "High", "Low", "Close", "Volume"]},
+        index=pd.DatetimeIndex([synthetic_date], name=frame.index.name),
+    )
+    work = pd.concat([frame, future_row])
+
+    out = pd.DataFrame(index=work.index)
     for lag in (3, 2, 1):
-        for name, values in candle_features(frame, lag).items():
+        for name, values in candle_features(work, lag).items():
             out[name] = values
 
-    o3, o2, o1 = (frame["Open"].shift(3), frame["Open"].shift(2), frame["Open"].shift(1))
-    h3, h2, h1 = (frame["High"].shift(3), frame["High"].shift(2), frame["High"].shift(1))
-    l3, l2, l1 = (frame["Low"].shift(3), frame["Low"].shift(2), frame["Low"].shift(1))
-    c3, c2, c1 = (frame["Close"].shift(3), frame["Close"].shift(2), frame["Close"].shift(1))
-    v3, v2, v1 = (frame["Volume"].shift(3).astype(float), frame["Volume"].shift(2).astype(float), frame["Volume"].shift(1).astype(float))
+    o3, o2, o1 = (work["Open"].shift(3), work["Open"].shift(2), work["Open"].shift(1))
+    h3, h2, h1 = (work["High"].shift(3), work["High"].shift(2), work["High"].shift(1))
+    l3, l2, l1 = (work["Low"].shift(3), work["Low"].shift(2), work["Low"].shift(1))
+    c3, c2, c1 = (work["Close"].shift(3), work["Close"].shift(2), work["Close"].shift(1))
+    v3, v2, v1 = (work["Volume"].shift(3).astype(float), work["Volume"].shift(2).astype(float), work["Volume"].shift(1).astype(float))
     r3, r2, r1 = (h3 - l3, h2 - l2, h1 - l1)
 
     # Relationships contained strictly inside the three-day window.
@@ -169,7 +178,7 @@ def build_rows(symbol: str, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     out["three_day_range"] = (pd.concat([h3, h2, h1], axis=1).max(axis=1) - pd.concat([l3, l2, l1], axis=1).min(axis=1)) / c3
     out["close_consistency"] = pd.concat([c3 / o3 - 1, c2 / o2 - 1, c1 / o1 - 1], axis=1).std(axis=1)
 
-    target_return = frame["Close"] / frame["Close"].shift(1) - 1.0
+    target_return = work["Close"] / work["Close"].shift(1) - 1.0
     out["target_return"] = target_return
     out["target"] = (target_return >= TARGET_RETURN).astype(int)
     out["outcome_group"] = pd.cut(

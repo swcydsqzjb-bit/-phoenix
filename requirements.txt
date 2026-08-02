@@ -1,0 +1,9 @@
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+yfinance>=0.2.65
+scikit-learn>=1.5,<2.0
+joblib>=1.4
+requests>=2.32
+lxml>=5.2
+html5lib>=1.1
+beautifulsoup4>=4.12
