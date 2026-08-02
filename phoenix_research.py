@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+import re
+from io import StringIO
 
 import joblib
 import numpy as np
@@ -44,14 +46,126 @@ def normalize_symbol(value: object) -> str:
     return symbol if symbol.endswith(".IS") else f"{symbol}.IS"
 
 
+def _clean_raw_symbol(value: object) -> str:
+    symbol = str(value).strip().upper().replace(".IS", "")
+    symbol = re.sub(r"[^A-Z0-9]", "", symbol)
+    if not re.fullmatch(r"[A-Z0-9]{2,8}", symbol):
+        return ""
+    return symbol
+
+
+def _symbols_from_tables(tables: list[pd.DataFrame]) -> set[str]:
+    found: set[str] = set()
+    for table in tables:
+        frame = table.copy()
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        candidate_columns = [
+            column for column in frame.columns
+            if any(key in column for key in ("symbol", "ticker", "kod", "code"))
+        ]
+        if not candidate_columns and len(frame.columns):
+            candidate_columns = [frame.columns[0]]
+        for column in candidate_columns:
+            for value in frame[column].tolist():
+                symbol = _clean_raw_symbol(value)
+                if symbol:
+                    found.add(symbol)
+    return found
+
+
+def fetch_stockanalysis_symbols(max_pages: int = 20) -> list[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PhoenixResearch/1.1; +https://github.com/)",
+        "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+    }
+    found: set[str] = set()
+    empty_pages = 0
+
+    for page in range(1, max_pages + 1):
+        url = "https://stockanalysis.com/list/borsa-istanbul/"
+        if page > 1:
+            url += f"?page={page}"
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code in {404, 410}:
+            break
+        response.raise_for_status()
+        page_symbols = _symbols_from_tables(pd.read_html(StringIO(response.text)))
+        page_symbols.update(
+            _clean_raw_symbol(value)
+            for value in re.findall(r"/quote/ist/([A-Z0-9]{2,8})/", response.text, flags=re.IGNORECASE)
+        )
+        page_symbols.discard("")
+        new_symbols = page_symbols - found
+        found.update(page_symbols)
+        print(f"Sembol kaynağı StockAnalysis sayfa {page}: +{len(new_symbols)} (toplam {len(found)})")
+        if not new_symbols:
+            empty_pages += 1
+            if empty_pages >= 2:
+                break
+        else:
+            empty_pages = 0
+
+    return sorted(found)
+
+
+def fetch_kap_symbols() -> list[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PhoenixResearch/1.1; +https://github.com/)",
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+    }
+    urls = ["https://kap.org.tr/tr/Sektorler", "https://kap.org.tr/en/Sektorler"]
+    found: set[str] = set()
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            found.update(_symbols_from_tables(pd.read_html(StringIO(response.text))))
+            if len(found) >= 300:
+                break
+        except Exception as exc:
+            print(f"KAP sembol kaynağı kullanılamadı ({url}): {exc}")
+    return sorted(found)
+
+
 def load_symbols(path: Path) -> list[str]:
+    """Fetch the current BIST universe; use symbols.csv only as a fallback."""
+    discovered: set[str] = set()
+
+    try:
+        discovered.update(fetch_stockanalysis_symbols())
+    except Exception as exc:
+        print(f"StockAnalysis sembol listesi alınamadı: {exc}")
+
+    # KAP is used as an independent backup/augmentation source.
+    if len(discovered) < 450:
+        try:
+            discovered.update(fetch_kap_symbols())
+        except Exception as exc:
+            print(f"KAP sembol listesi alınamadı: {exc}")
+
+    if discovered:
+        symbols = sorted(normalize_symbol(value) for value in discovered)
+        symbols = [symbol for symbol in symbols if symbol]
+        (PROJECT / "phoenix_symbols_discovered.csv").write_text(
+            "\n".join(symbol.removesuffix(".IS") for symbol in symbols) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Otomatik BIST evreni bulundu: {len(symbols)} sembol")
+        if len(symbols) < 300:
+            print("UYARI: Otomatik listede beklenenden az sembol bulundu; symbols.csv ile birleştirilecek.")
+        if path.exists():
+            frame = pd.read_csv(path, encoding="utf-8-sig", header=None)
+            symbols = sorted(set(symbols) | {normalize_symbol(v) for v in frame.to_numpy().ravel() if normalize_symbol(v)})
+        return symbols
+
     if not path.exists():
-        raise FileNotFoundError(f"Sembol dosyası bulunamadı: {path}")
+        raise FileNotFoundError(f"Otomatik liste alınamadı ve sembol dosyası bulunamadı: {path}")
     frame = pd.read_csv(path, encoding="utf-8-sig", header=None)
     symbols = sorted({normalize_symbol(v) for v in frame.to_numpy().ravel()})
-    symbols = [s for s in symbols if s]
+    symbols = [symbol for symbol in symbols if symbol]
     if not symbols:
-        raise ValueError("symbols.csv içinde geçerli hisse kodu bulunamadı.")
+        raise ValueError("Otomatik liste alınamadı ve symbols.csv içinde geçerli hisse kodu bulunamadı.")
+    print(f"Yedek symbols.csv kullanılıyor: {len(symbols)} sembol")
     return symbols
 
 
@@ -129,25 +243,16 @@ def build_rows(symbol: str, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     if len(frame) < 12:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Add one synthetic future row. Its features are built from the latest
-    # three completed sessions, so the live scan truly predicts tomorrow.
-    synthetic_date = pd.Timestamp(frame.index.max()) + pd.offsets.BDay(1)
-    future_row = pd.DataFrame(
-        {column: [np.nan] for column in ["Open", "High", "Low", "Close", "Volume"]},
-        index=pd.DatetimeIndex([synthetic_date], name=frame.index.name),
-    )
-    work = pd.concat([frame, future_row])
-
-    out = pd.DataFrame(index=work.index)
+    out = pd.DataFrame(index=frame.index)
     for lag in (3, 2, 1):
-        for name, values in candle_features(work, lag).items():
+        for name, values in candle_features(frame, lag).items():
             out[name] = values
 
-    o3, o2, o1 = (work["Open"].shift(3), work["Open"].shift(2), work["Open"].shift(1))
-    h3, h2, h1 = (work["High"].shift(3), work["High"].shift(2), work["High"].shift(1))
-    l3, l2, l1 = (work["Low"].shift(3), work["Low"].shift(2), work["Low"].shift(1))
-    c3, c2, c1 = (work["Close"].shift(3), work["Close"].shift(2), work["Close"].shift(1))
-    v3, v2, v1 = (work["Volume"].shift(3).astype(float), work["Volume"].shift(2).astype(float), work["Volume"].shift(1).astype(float))
+    o3, o2, o1 = (frame["Open"].shift(3), frame["Open"].shift(2), frame["Open"].shift(1))
+    h3, h2, h1 = (frame["High"].shift(3), frame["High"].shift(2), frame["High"].shift(1))
+    l3, l2, l1 = (frame["Low"].shift(3), frame["Low"].shift(2), frame["Low"].shift(1))
+    c3, c2, c1 = (frame["Close"].shift(3), frame["Close"].shift(2), frame["Close"].shift(1))
+    v3, v2, v1 = (frame["Volume"].shift(3).astype(float), frame["Volume"].shift(2).astype(float), frame["Volume"].shift(1).astype(float))
     r3, r2, r1 = (h3 - l3, h2 - l2, h1 - l1)
 
     # Relationships contained strictly inside the three-day window.
@@ -178,7 +283,7 @@ def build_rows(symbol: str, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     out["three_day_range"] = (pd.concat([h3, h2, h1], axis=1).max(axis=1) - pd.concat([l3, l2, l1], axis=1).min(axis=1)) / c3
     out["close_consistency"] = pd.concat([c3 / o3 - 1, c2 / o2 - 1, c1 / o1 - 1], axis=1).std(axis=1)
 
-    target_return = work["Close"] / work["Close"].shift(1) - 1.0
+    target_return = frame["Close"] / frame["Close"].shift(1) - 1.0
     out["target_return"] = target_return
     out["target"] = (target_return >= TARGET_RETURN).astype(int)
     out["outcome_group"] = pd.cut(
@@ -436,6 +541,7 @@ def main() -> None:
     args = parser.parse_args()
 
     symbols = load_symbols(Path(args.symbols))
+    print(f"PHOENIX taraması başlayacak: {len(symbols)} sembol")
     bundle = create_dataset(symbols, args.start, args.refresh)
     bundle.history.to_csv(TRAIN_FILE, index=False, encoding="utf-8-sig")
 
