@@ -17,6 +17,7 @@ import requests
 import yfinance as yf
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import RobustScaler
 
@@ -332,73 +333,139 @@ def create_dataset(symbols: Iterable[str], start: str, refresh: bool) -> Dataset
     )
 
 
+def wilson_lower_bound(successes: int, total: int, z: float = 1.96) -> float:
+    if total <= 0:
+        return 0.0
+    p = successes / total
+    denom = 1.0 + z * z / total
+    centre = p + z * z / (2.0 * total)
+    margin = z * np.sqrt((p * (1.0 - p) + z * z / (4.0 * total)) / total)
+    return float((centre - margin) / denom)
+
+
 def select_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> tuple[float, dict[str, float | int]]:
     precision, recall, thresholds = precision_recall_curve(y_true, probabilities)
-    choices: list[tuple[float, float, float, int]] = []
+    choices: list[tuple[float, float, float, int, float]] = []
 
     for p, r, threshold in zip(precision[:-1], recall[:-1], thresholds):
-        signal_count = int((probabilities >= threshold).sum())
-        if signal_count >= 15 and r >= 0.02:
-            choices.append((float(p), float(r), float(threshold), signal_count))
+        mask = probabilities >= threshold
+        signal_count = int(mask.sum())
+        true_count = int(y_true[mask].sum()) if signal_count else 0
+        if signal_count >= 25 and r >= 0.01:
+            lower = wilson_lower_bound(true_count, signal_count)
+            choices.append((float(p), float(r), float(threshold), signal_count, lower))
 
     if not choices:
-        return 0.50, {"precision": 0.0, "recall": 0.0, "signals": 0}
+        return 0.50, {"precision": 0.0, "recall": 0.0, "signals": 0, "precision_lower_bound": 0.0}
 
-    # False alarms are costly; prioritize precision, then recall.
-    best = max(choices, key=lambda item: (item[0], item[1]))
-    return best[2], {"precision": best[0], "recall": best[1], "signals": best[3]}
+    # Küçük örneklerde şişen hassasiyet yerine güven aralığının alt sınırını önceliklendir.
+    best = max(choices, key=lambda item: (item[4], item[0], item[1]))
+    return best[2], {
+        "precision": best[0],
+        "recall": best[1],
+        "signals": best[3],
+        "precision_lower_bound": best[4],
+    }
 
 
 def train(history: pd.DataFrame) -> dict:
     history = history.sort_values(["date", "symbol"]).reset_index(drop=True)
     feature_columns = [c for c in history.columns if c not in NON_FEATURES]
-    unique_dates = np.array(sorted(pd.to_datetime(history["date"]).unique()))
-    if len(unique_dates) < 150:
-        raise RuntimeError("Tarih sıralı test için yeterli işlem günü yok.")
+    dates = pd.to_datetime(history["date"])
+    unique_dates = np.array(sorted(dates.unique()))
+    if len(unique_dates) < 250:
+        raise RuntimeError("Tarih sıralı yürüyen test için yeterli işlem günü yok.")
 
-    split_date = pd.Timestamp(unique_dates[int(len(unique_dates) * 0.80)])
-    train_mask = pd.to_datetime(history["date"]) < split_date
-    valid_mask = ~train_mask
+    # Üç ayrı ileri-zaman testi. Her doğrulama bölümü yalnızca kendisinden önceki tarihlerle eğitilir.
+    fold_points = [(0.60, 0.72), (0.72, 0.84), (0.84, 1.00)]
+    oof_probabilities = np.full(len(history), np.nan, dtype=float)
+    fold_metrics: list[dict] = []
 
-    model = ExtraTreesClassifier(
-        n_estimators=650,
+    for fold_no, (train_end_ratio, valid_end_ratio) in enumerate(fold_points, start=1):
+        train_end = pd.Timestamp(unique_dates[max(1, int(len(unique_dates) * train_end_ratio)) - 1])
+        valid_end = pd.Timestamp(unique_dates[max(2, int(len(unique_dates) * valid_end_ratio)) - 1])
+        train_mask = dates <= train_end
+        valid_mask = (dates > train_end) & (dates <= valid_end)
+        if int(valid_mask.sum()) == 0 or history.loc[train_mask, "target"].nunique() < 2:
+            continue
+
+        fold_model = ExtraTreesClassifier(
+            n_estimators=500,
+            max_depth=18,
+            min_samples_leaf=8,
+            max_features="sqrt",
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=RANDOM_STATE + fold_no,
+        )
+        fold_model.fit(history.loc[train_mask, feature_columns], history.loc[train_mask, "target"].astype(int))
+        raw = fold_model.predict_proba(history.loc[valid_mask, feature_columns])[:, 1]
+        oof_probabilities[valid_mask.to_numpy()] = raw
+        y_fold = history.loc[valid_mask, "target"].astype(int).to_numpy()
+        fold_metrics.append({
+            "fold": fold_no,
+            "train_end": str(train_end.date()),
+            "valid_end": str(valid_end.date()),
+            "validation_rows": int(valid_mask.sum()),
+            "positive_rate": float(y_fold.mean()),
+            "average_precision_raw": float(average_precision_score(y_fold, raw)),
+        })
+
+    oof_mask = np.isfinite(oof_probabilities)
+    if int(oof_mask.sum()) < 1000:
+        raise RuntimeError("Yürüyen test için yeterli doğrulama tahmini üretilemedi.")
+
+    y_oof = history.loc[oof_mask, "target"].astype(int).to_numpy()
+    raw_oof = oof_probabilities[oof_mask]
+
+    # Ağaç olasılıkları aşırı yüksek görünebildiği için zaman dışı tahminlerle kalibrasyon.
+    calibrator = LogisticRegression(solver="lbfgs", random_state=RANDOM_STATE)
+    calibrator.fit(raw_oof.reshape(-1, 1), y_oof)
+    calibrated_oof = calibrator.predict_proba(raw_oof.reshape(-1, 1))[:, 1]
+    threshold, threshold_stats = select_threshold(y_oof, calibrated_oof)
+
+    metrics = {
+        "test_start_date": str(pd.Timestamp(history.loc[oof_mask, "date"].min()).date()),
+        "validation_rows": int(oof_mask.sum()),
+        "positive_rate_validation": float(y_oof.mean()),
+        "average_precision": float(average_precision_score(y_oof, calibrated_oof)),
+        "roc_auc": float(roc_auc_score(y_oof, calibrated_oof)) if len(np.unique(y_oof)) > 1 else None,
+        "threshold": float(threshold),
+        "threshold_precision": float(threshold_stats["precision"]),
+        "threshold_precision_lower_bound": float(threshold_stats["precision_lower_bound"]),
+        "threshold_recall": float(threshold_stats["recall"]),
+        "threshold_signals": int(threshold_stats["signals"]),
+        "folds": fold_metrics,
+    }
+
+    final_model = ExtraTreesClassifier(
+        n_estimators=800,
         max_depth=18,
-        min_samples_leaf=6,
+        min_samples_leaf=8,
         max_features="sqrt",
         class_weight="balanced",
         n_jobs=-1,
         random_state=RANDOM_STATE,
     )
-    model.fit(history.loc[train_mask, feature_columns], history.loc[train_mask, "target"].astype(int))
-    valid_probabilities = model.predict_proba(history.loc[valid_mask, feature_columns])[:, 1]
-    y_valid = history.loc[valid_mask, "target"].astype(int).to_numpy()
-    threshold, threshold_stats = select_threshold(y_valid, valid_probabilities)
-
-    metrics = {
-        "split_date": str(split_date.date()),
-        "train_rows": int(train_mask.sum()),
-        "validation_rows": int(valid_mask.sum()),
-        "positive_rate_train": float(history.loc[train_mask, "target"].mean()),
-        "positive_rate_validation": float(history.loc[valid_mask, "target"].mean()),
-        "average_precision": float(average_precision_score(y_valid, valid_probabilities)),
-        "roc_auc": float(roc_auc_score(y_valid, valid_probabilities)) if len(np.unique(y_valid)) > 1 else None,
-        "threshold": float(threshold),
-        "threshold_precision": float(threshold_stats["precision"]),
-        "threshold_recall": float(threshold_stats["recall"]),
-        "threshold_signals": int(threshold_stats["signals"]),
-    }
-
-    # Refit on all available past rows after evaluating out-of-time performance.
-    model.fit(history[feature_columns], history["target"].astype(int))
+    final_model.fit(history[feature_columns], history["target"].astype(int))
 
     scaler = RobustScaler()
     scaled_history = scaler.fit_transform(history[feature_columns])
-    neighbor_count = min(75, len(history))
-    neighbors = NearestNeighbors(n_neighbors=neighbor_count, metric="euclidean", n_jobs=-1)
+    # Aynı hisseyi ve çok yakın tarihleri ayıklayabilmek için daha geniş komşu havuzu.
+    query_neighbor_count = min(250, len(history))
+    neighbors = NearestNeighbors(n_neighbors=query_neighbor_count, metric="euclidean", n_jobs=-1)
     neighbors.fit(scaled_history)
 
+    importances = sorted(
+        zip(feature_columns, final_model.feature_importances_),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:15]
+    metrics["top_features"] = [{"feature": name, "importance": float(value)} for name, value in importances]
+
     artifact = {
-        "model": model,
+        "model": final_model,
+        "calibrator": calibrator,
         "scaler": scaler,
         "neighbors": neighbors,
         "history_reference": history[["symbol", "date", "target_return", "outcome_group"] + feature_columns],
@@ -409,7 +476,6 @@ def train(history: pd.DataFrame) -> dict:
     joblib.dump(artifact, MODEL_FILE)
     META_FILE.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     return artifact
-
 
 def describe_pattern(row: pd.Series) -> str:
     reasons: list[str] = []
@@ -437,47 +503,69 @@ def describe_pattern(row: pd.Series) -> str:
 def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
     features = artifact["feature_columns"]
     latest = latest.dropna(subset=features).copy()
-    latest["model_probability"] = artifact["model"].predict_proba(latest[features])[:, 1]
+    raw_probability = artifact["model"].predict_proba(latest[features])[:, 1]
+    latest["model_probability"] = artifact["calibrator"].predict_proba(raw_probability.reshape(-1, 1))[:, 1]
 
     scaled_latest = artifact["scaler"].transform(latest[features])
     distances, indices = artifact["neighbors"].kneighbors(scaled_latest)
     reference = artifact["history_reference"].reset_index(drop=True)
+    base_rate = float(artifact["metrics"].get("positive_rate_validation", 0.0))
+    neighbor_floor = max(0.10, base_rate * 2.5)
 
     rows: list[dict] = []
     for row_index, (_, source_row) in enumerate(latest.iterrows()):
-        nearby = reference.iloc[indices[row_index]].copy()
-        nearby["distance"] = distances[row_index]
-        positive_rate = float((nearby["target_return"] >= 0.09).mean())
-        five_to_nine_rate = float(((nearby["target_return"] >= 0.05) & (nearby["target_return"] < 0.09)).mean())
-        two_to_five_rate = float(((nearby["target_return"] >= 0.02) & (nearby["target_return"] < 0.05)).mean())
-        failure_rate = 1.0 - positive_rate - five_to_nine_rate - two_to_five_rate
-        mean_distance = float(np.mean(distances[row_index]))
-        similarity = 1.0 / (1.0 + mean_distance)
+        candidate = reference.iloc[indices[row_index]].copy()
+        candidate["distance"] = distances[row_index]
+        candidate["date"] = pd.to_datetime(candidate["date"])
+        source_date = pd.Timestamp(source_row["date"])
+
+        # Aynı hissenin kendi geçmişini ve son 45 gündeki çok yakın tekrarları kanıt listesinden çıkar.
+        filtered = candidate[
+            (candidate["symbol"] != source_row["symbol"])
+            & (candidate["date"] <= source_date - pd.Timedelta(days=45))
+        ].head(75)
+        if len(filtered) < 40:
+            filtered = candidate[candidate["date"] <= source_date - pd.Timedelta(days=10)].head(75)
+        nearby = filtered
+
+        positive_count = int((nearby["target_return"] >= 0.09).sum())
+        positive_rate = float(positive_count / len(nearby)) if len(nearby) else 0.0
+        five_to_nine_rate = float(((nearby["target_return"] >= 0.05) & (nearby["target_return"] < 0.09)).mean()) if len(nearby) else 0.0
+        two_to_five_rate = float(((nearby["target_return"] >= 0.02) & (nearby["target_return"] < 0.05)).mean()) if len(nearby) else 0.0
+        failure_rate = max(0.0, 1.0 - positive_rate - five_to_nine_rate - two_to_five_rate)
+        mean_distance = float(nearby["distance"].mean()) if len(nearby) else float("inf")
+        similarity = 1.0 / (1.0 + mean_distance) if np.isfinite(mean_distance) else 0.0
+        neighbor_lower = wilson_lower_bound(positive_count, len(nearby))
 
         closest = nearby.sort_values("distance").head(5)
         examples = " | ".join(
             f"{r.symbol} {pd.Timestamp(r.date).date()} ({r.target_return * 100:+.1f}%)"
             for r in closest.itertuples()
         )
-        score = 100.0 * (
-            0.60 * float(source_row.get("model_probability", latest.loc[source_row.name, "model_probability"]))
-            + 0.25 * positive_rate
-            + 0.15 * similarity
+        probability = float(source_row.get("model_probability", latest.loc[source_row.name, "model_probability"]))
+        score = 100.0 * (0.55 * probability + 0.25 * positive_rate + 0.10 * neighbor_lower + 0.10 * similarity)
+        strong = (
+            probability >= artifact["threshold"]
+            and positive_rate >= neighbor_floor
+            and positive_count >= 8
         )
-        probability = float(latest.loc[source_row.name, "model_probability"])
-        signal = "YARIN %9+ BEKLENTİSİ" if probability >= artifact["threshold"] else "İZLEME ADAYI"
+        signal = "YARIN %9+ BEKLENTİSİ" if strong else "İZLEME ADAYI"
+        confidence = "YÜKSEK" if strong and neighbor_lower >= 0.12 else ("ORTA" if strong else "DÜŞÜK")
 
         rows.append({
             "date": source_row["date"],
             "symbol": source_row["symbol"],
             "signal": signal,
+            "confidence": confidence,
             "phoenix_score": score,
             "model_probability": probability,
             "neighbor_count": int(len(nearby)),
+            "neighbor_9plus_count": positive_count,
             "neighbor_9plus_rate": positive_rate,
+            "neighbor_9plus_lower_bound": neighbor_lower,
             "neighbor_5to9_rate": five_to_nine_rate,
             "neighbor_2to5_rate": two_to_five_rate,
-            "neighbor_failure_rate": max(0.0, failure_rate),
+            "neighbor_failure_rate": failure_rate,
             "similarity": similarity,
             "reason": describe_pattern(source_row),
             "closest_examples": examples,
@@ -486,10 +574,9 @@ def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
     report = pd.DataFrame(rows)
     signal_rank = report["signal"].eq("YARIN %9+ BEKLENTİSİ").astype(int)
     report = report.assign(_signal_rank=signal_rank).sort_values(
-        ["_signal_rank", "phoenix_score"], ascending=[False, False]
+        ["_signal_rank", "phoenix_score", "neighbor_9plus_lower_bound"], ascending=[False, False, False]
     ).drop(columns="_signal_rank")
     return report.reset_index(drop=True)
-
 
 def send_telegram(message: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -497,21 +584,38 @@ def send_telegram(message: str) -> None:
     if not token or not chat_id:
         print("Telegram bilgileri bulunmadı; mesaj gönderilmedi.")
         return
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message},
-        timeout=30,
-    )
-    response.raise_for_status()
 
+    # Telegram tek mesaj sınırının altında güvenli parçalar gönder.
+    chunks: list[str] = []
+    current = ""
+    for block in message.split("\n\n"):
+        proposed = block if not current else current + "\n\n" + block
+        if len(proposed) <= 3600:
+            current = proposed
+        else:
+            if current:
+                chunks.append(current)
+            current = block
+    if current:
+        chunks.append(current)
+
+    for index, chunk in enumerate(chunks, start=1):
+        prefix = f"[{index}/{len(chunks)}]\n" if len(chunks) > 1 else ""
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": prefix + chunk},
+            timeout=30,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Telegram hatası {response.status_code}: {response.text}")
 
 def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
     selected = report.head(top_n)
     lines = [
         "🔥 PHOENIX RESEARCH — 3 GÜNLÜK %9+ TAHMİNİ",
-        f"Tarih sıralı test başlangıcı: {metrics['split_date']}",
-        f"Geçmiş test sinyal hassasiyeti: %{metrics['threshold_precision'] * 100:.1f}",
-        f"Geçmiş test yakalama oranı: %{metrics['threshold_recall'] * 100:.1f}",
+        f"Yürüyen test başlangıcı: {metrics['test_start_date']}",
+        f"Yürüyen test hassasiyeti: %{metrics['threshold_precision'] * 100:.1f} (alt güven sınırı %{metrics['threshold_precision_lower_bound'] * 100:.1f})",
+        f"Yürüyen test yakalama oranı: %{metrics['threshold_recall'] * 100:.1f}",
         "RSI, EMA, MACD ve eski bot skorları kullanılmadı.",
         "Yalnızca son 3 tamamlanmış günün OHLCV davranışı kullanıldı.",
         "",
@@ -519,9 +623,9 @@ def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
 
     for row in selected.itertuples():
         lines.extend([
-            f"{row.symbol} — {row.signal}",
-            f"Phoenix: {row.phoenix_score:.1f}/100 | Model: %{row.model_probability * 100:.1f}",
-            f"Benzer {row.neighbor_count} olay: %9+ %{row.neighbor_9plus_rate * 100:.1f} | %5-9 %{row.neighbor_5to9_rate * 100:.1f} | %2-5 %{row.neighbor_2to5_rate * 100:.1f}",
+            f"{row.symbol} — {row.signal} | Güven: {row.confidence}",
+            f"Phoenix: {row.phoenix_score:.1f}/100 | Kalibre olasılık: %{row.model_probability * 100:.1f}",
+            f"Benzer {row.neighbor_count} olay: %9+ {row.neighbor_9plus_count} adet (%{row.neighbor_9plus_rate * 100:.1f}; alt sınır %{row.neighbor_9plus_lower_bound * 100:.1f}) | %5-9 %{row.neighbor_5to9_rate * 100:.1f} | %2-5 %{row.neighbor_2to5_rate * 100:.1f}",
             f"Neden: {row.reason}",
             f"En yakın örnekler: {row.closest_examples}",
             "",
@@ -532,7 +636,7 @@ def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PHOENIX Research: yalnızca önceki 3 günlük OHLCV ile ertesi gün %9+ araştırması")
+    parser = argparse.ArgumentParser(description="PHOENIX Research V2: yalnızca önceki 3 günlük OHLCV ile yürüyen test ve kalibre %9+ araştırması")
     parser.add_argument("--symbols", default="symbols.csv")
     parser.add_argument("--start", default="2018-01-01")
     parser.add_argument("--refresh", action="store_true")
