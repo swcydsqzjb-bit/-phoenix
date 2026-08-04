@@ -544,13 +544,24 @@ def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
         )
         probability = float(source_row.get("model_probability", latest.loc[source_row.name, "model_probability"]))
         score = 100.0 * (0.55 * probability + 0.25 * positive_rate + 0.10 * neighbor_lower + 0.10 * similarity)
-        strong = (
-            probability >= artifact["threshold"]
-            and positive_rate >= neighbor_floor
+        # V3: düşük güvenli adayları tamamen ele. Bir adayın rapora girebilmesi için
+        # kalibre olasılığın en az %60, benzer örnek sayısının en az 30 ve
+        # tarihsel komşu grubunda yeterli %9+ kanıtının bulunması gerekir.
+        qualified = (
+            probability >= 0.60
+            and len(nearby) >= 30
+            and positive_rate >= max(neighbor_floor, 0.18)
             and positive_count >= 8
+            and neighbor_lower >= 0.10
         )
-        signal = "YARIN %9+ BEKLENTİSİ" if strong else "İZLEME ADAYI"
-        confidence = "YÜKSEK" if strong and neighbor_lower >= 0.12 else ("ORTA" if strong else "DÜŞÜK")
+        high_confidence = (
+            qualified
+            and probability >= 0.72
+            and neighbor_lower >= 0.18
+            and positive_count >= 12
+        )
+        signal = "YARIN %9+ BEKLENTİSİ" if qualified else "ELENDİ"
+        confidence = "YÜKSEK" if high_confidence else ("ORTA" if qualified else "DÜŞÜK")
 
         rows.append({
             "date": source_row["date"],
@@ -572,10 +583,15 @@ def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
         })
 
     report = pd.DataFrame(rows)
-    signal_rank = report["signal"].eq("YARIN %9+ BEKLENTİSİ").astype(int)
-    report = report.assign(_signal_rank=signal_rank).sort_values(
-        ["_signal_rank", "phoenix_score", "neighbor_9plus_lower_bound"], ascending=[False, False, False]
-    ).drop(columns="_signal_rank")
+    # Telegram ve nihai CSV yalnızca ORTA/YÜKSEK güvenli adayları içerir.
+    report = report[report["signal"].eq("YARIN %9+ BEKLENTİSİ")].copy()
+    if report.empty:
+        return report.reset_index(drop=True)
+    confidence_rank = report["confidence"].map({"YÜKSEK": 2, "ORTA": 1}).fillna(0)
+    report = report.assign(_confidence_rank=confidence_rank).sort_values(
+        ["_confidence_rank", "phoenix_score", "neighbor_9plus_lower_bound"],
+        ascending=[False, False, False],
+    ).drop(columns="_confidence_rank")
     return report.reset_index(drop=True)
 
 def send_telegram(message: str) -> None:
@@ -610,16 +626,24 @@ def send_telegram(message: str) -> None:
             raise RuntimeError(f"Telegram hatası {response.status_code}: {response.text}")
 
 def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
-    selected = report.head(top_n)
+    selected = report.head(min(top_n, 5))
     lines = [
-        "🔥 PHOENIX RESEARCH — 3 GÜNLÜK %9+ TAHMİNİ",
+        "🔥 PHOENIX ALPHA V3 — 3 GÜNLÜK %9+ TAHMİNİ",
         f"Yürüyen test başlangıcı: {metrics['test_start_date']}",
         f"Yürüyen test hassasiyeti: %{metrics['threshold_precision'] * 100:.1f} (alt güven sınırı %{metrics['threshold_precision_lower_bound'] * 100:.1f})",
         f"Yürüyen test yakalama oranı: %{metrics['threshold_recall'] * 100:.1f}",
         "RSI, EMA, MACD ve eski bot skorları kullanılmadı.",
         "Yalnızca son 3 tamamlanmış günün OHLCV davranışı kullanıldı.",
+        "Filtre: kalibre olasılık ≥ %60, en az 30 benzer olay ve yalnızca ORTA/YÜKSEK güven.",
         "",
     ]
+
+    if selected.empty:
+        lines.extend([
+            "Bugün ORTA veya YÜKSEK güven eşiğini geçen aday bulunmadı.",
+            "PHOENIX düşük güvenli hisseleri özellikle rapora eklemedi.",
+            "",
+        ])
 
     for row in selected.itertuples():
         lines.extend([
@@ -636,7 +660,7 @@ def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PHOENIX Research V2: yalnızca önceki 3 günlük OHLCV ile yürüyen test ve kalibre %9+ araştırması")
+    parser = argparse.ArgumentParser(description="PHOENIX Alpha V3: yalnızca önceki 3 günlük OHLCV ile yürüyen test ve kalibre %9+ araştırması")
     parser.add_argument("--symbols", default="symbols.csv")
     parser.add_argument("--start", default="2018-01-01")
     parser.add_argument("--refresh", action="store_true")
