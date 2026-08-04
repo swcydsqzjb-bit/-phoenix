@@ -544,11 +544,14 @@ def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
         )
         probability = float(source_row.get("model_probability", latest.loc[source_row.name, "model_probability"]))
         score = 100.0 * (0.55 * probability + 0.25 * positive_rate + 0.10 * neighbor_lower + 0.10 * similarity)
-        # V3: düşük güvenli adayları tamamen ele. Bir adayın rapora girebilmesi için
-        # kalibre olasılığın en az %60, benzer örnek sayısının en az 30 ve
-        # tarihsel komşu grubunda yeterli %9+ kanıtının bulunması gerekir.
+        # V3.1: sabit %60 eşiği kalibre olasılıkların doğal aralığından çok yüksekti.
+        # Bunun yerine yürüyen testte verinin kendisinin seçtiği eşiği kullanıyoruz.
+        learned_threshold = float(artifact.get("threshold", artifact["metrics"].get("threshold", 0.30)))
+        medium_probability_floor = max(0.28, learned_threshold)
+        high_probability_floor = max(0.38, learned_threshold + 0.08)
+
         qualified = (
-            probability >= 0.60
+            probability >= medium_probability_floor
             and len(nearby) >= 30
             and positive_rate >= max(neighbor_floor, 0.18)
             and positive_count >= 8
@@ -556,7 +559,7 @@ def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
         )
         high_confidence = (
             qualified
-            and probability >= 0.72
+            and probability >= high_probability_floor
             and neighbor_lower >= 0.18
             and positive_count >= 12
         )
@@ -628,13 +631,13 @@ def send_telegram(message: str) -> None:
 def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
     selected = report.head(min(top_n, 5))
     lines = [
-        "🔥 PHOENIX ALPHA V3 — 3 GÜNLÜK %9+ TAHMİNİ",
+        "🔥 PHOENIX ALPHA V3.1 — 3 GÜNLÜK %9+ TAHMİNİ",
         f"Yürüyen test başlangıcı: {metrics['test_start_date']}",
         f"Yürüyen test hassasiyeti: %{metrics['threshold_precision'] * 100:.1f} (alt güven sınırı %{metrics['threshold_precision_lower_bound'] * 100:.1f})",
         f"Yürüyen test yakalama oranı: %{metrics['threshold_recall'] * 100:.1f}",
         "RSI, EMA, MACD ve eski bot skorları kullanılmadı.",
         "Yalnızca son 3 tamamlanmış günün OHLCV davranışı kullanıldı.",
-        "Filtre: kalibre olasılık ≥ %60, en az 30 benzer olay ve yalnızca ORTA/YÜKSEK güven.",
+        f"Filtre: yürüyen test eşiği ≥ %{metrics['threshold'] * 100:.1f}, en az 30 benzer olay ve yalnızca ORTA/YÜKSEK güven.",
         "",
     ]
 
@@ -660,7 +663,7 @@ def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PHOENIX Alpha V3: yalnızca önceki 3 günlük OHLCV ile yürüyen test ve kalibre %9+ araştırması")
+    parser = argparse.ArgumentParser(description="PHOENIX Alpha V3.1: yalnızca önceki 3 günlük OHLCV ile adaptif eşik ve kalibre %9+ araştırması")
     parser.add_argument("--symbols", default="symbols.csv")
     parser.add_argument("--start", default="2018-01-01")
     parser.add_argument("--refresh", action="store_true")
