@@ -585,17 +585,39 @@ def predict(artifact: dict, latest: pd.DataFrame) -> pd.DataFrame:
             "closest_examples": examples,
         })
 
-    report = pd.DataFrame(rows)
-    # Telegram ve nihai CSV yalnızca ORTA/YÜKSEK güvenli adayları içerir.
-    report = report[report["signal"].eq("YARIN %9+ BEKLENTİSİ")].copy()
-    if report.empty:
-        return report.reset_index(drop=True)
-    confidence_rank = report["confidence"].map({"YÜKSEK": 2, "ORTA": 1}).fillna(0)
-    report = report.assign(_confidence_rank=confidence_rank).sort_values(
-        ["_confidence_rank", "phoenix_score", "neighbor_9plus_lower_bound"],
+    all_rows = pd.DataFrame(rows)
+
+    # Öncelik daima gerçek ORTA/YÜKSEK güven sinyalleridir.
+    strict = all_rows[all_rows["signal"].eq("YARIN %9+ BEKLENTİSİ")].copy()
+    if not strict.empty:
+        confidence_rank = strict["confidence"].map({"YÜKSEK": 2, "ORTA": 1}).fillna(0)
+        strict = strict.assign(_confidence_rank=confidence_rank).sort_values(
+            ["_confidence_rank", "phoenix_score", "neighbor_9plus_lower_bound"],
+            ascending=[False, False, False],
+        ).drop(columns="_confidence_rank")
+        return strict.reset_index(drop=True)
+
+    # V3.2: Günlerce tamamen boş rapor vermek yerine, katı sinyal oluşmadığında
+    # en yakın 5 yapıyı açıkça "YAKIN TAKİP" etiketiyle gösterir.
+    # Bunlar %9+ beklentisi değildir; hangi şartın henüz eksik olduğunu izlemek içindir.
+    learned_threshold = float(artifact.get("threshold", artifact["metrics"].get("threshold", 0.30)))
+    watch_floor = max(0.22, learned_threshold - 0.10)
+    watch = all_rows[
+        (all_rows["model_probability"] >= watch_floor)
+        & (all_rows["neighbor_count"] >= 30)
+        & (all_rows["neighbor_9plus_count"] >= 5)
+        & (all_rows["neighbor_9plus_lower_bound"] >= 0.06)
+    ].copy()
+    if watch.empty:
+        return watch.reset_index(drop=True)
+
+    watch["signal"] = "YAKIN TAKİP — KATI EŞİK ALTI"
+    watch["confidence"] = "YAKIN TAKİP"
+    watch = watch.sort_values(
+        ["phoenix_score", "model_probability", "neighbor_9plus_lower_bound"],
         ascending=[False, False, False],
-    ).drop(columns="_confidence_rank")
-    return report.reset_index(drop=True)
+    ).head(5)
+    return watch.reset_index(drop=True)
 
 def send_telegram(message: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -631,20 +653,27 @@ def send_telegram(message: str) -> None:
 def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
     selected = report.head(min(top_n, 5))
     lines = [
-        "🔥 PHOENIX ALPHA V3.1 — 3 GÜNLÜK %9+ TAHMİNİ",
+        "🔥 PHOENIX ALPHA V3.2 — 3 GÜNLÜK %9+ TAHMİNİ",
         f"Yürüyen test başlangıcı: {metrics['test_start_date']}",
         f"Yürüyen test hassasiyeti: %{metrics['threshold_precision'] * 100:.1f} (alt güven sınırı %{metrics['threshold_precision_lower_bound'] * 100:.1f})",
         f"Yürüyen test yakalama oranı: %{metrics['threshold_recall'] * 100:.1f}",
         "RSI, EMA, MACD ve eski bot skorları kullanılmadı.",
         "Yalnızca son 3 tamamlanmış günün OHLCV davranışı kullanıldı.",
-        f"Filtre: yürüyen test eşiği ≥ %{metrics['threshold'] * 100:.1f}, en az 30 benzer olay ve yalnızca ORTA/YÜKSEK güven.",
+        f"Katı sinyal filtresi: yürüyen test eşiği ≥ %{metrics['threshold'] * 100:.1f}, en az 30 benzer olay ve ORTA/YÜKSEK güven.",
+        "Katı sinyal yoksa en yakın yapılar yalnızca YAKIN TAKİP etiketiyle gösterilir.",
         "",
     ]
 
     if selected.empty:
         lines.extend([
-            "Bugün ORTA veya YÜKSEK güven eşiğini geçen aday bulunmadı.",
-            "PHOENIX düşük güvenli hisseleri özellikle rapora eklemedi.",
+            "Bugün katı sinyal veya izlemeye değer yakın yapı bulunmadı.",
+            "PHOENIX zayıf eşleşmeleri rapora eklemedi.",
+            "",
+        ])
+    elif (selected["confidence"] == "YAKIN TAKİP").all():
+        lines.extend([
+            "Bugün ORTA/YÜKSEK güvenli kesin aday yok.",
+            "Aşağıdakiler yalnızca katı eşiğe en yakın yapılardır; %9+ beklentisi olarak okunmamalıdır.",
             "",
         ])
 
@@ -663,7 +692,7 @@ def format_message(report: pd.DataFrame, metrics: dict, top_n: int) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PHOENIX Alpha V3.1: yalnızca önceki 3 günlük OHLCV ile adaptif eşik ve kalibre %9+ araştırması")
+    parser = argparse.ArgumentParser(description="PHOENIX Alpha V3.2: katı sinyal + şeffaf yakın takip raporu")
     parser.add_argument("--symbols", default="symbols.csv")
     parser.add_argument("--start", default="2018-01-01")
     parser.add_argument("--refresh", action="store_true")
