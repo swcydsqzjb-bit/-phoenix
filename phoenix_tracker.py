@@ -2,185 +2,264 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+import os
+
 import pandas as pd
+import requests
 import yfinance as yf
 
-TRACK_FILE = Path("phoenix_tracking.csv")
+PROJECT = Path(__file__).resolve().parent
+TRACK_FILE = PROJECT / "phoenix_tracking.csv"
+PREDICTIONS_FILE = PROJECT / "phoenix_research_predictions.csv"
+
+COLUMNS = [
+    "signal_date", "symbol", "signal_close", "phoenix_score",
+    "calibrated_probability", "signal_type", "confidence",
+    "day1_close_pct", "day2_close_pct", "day3_close_pct",
+    "max_high_pct_3d", "status", "last_checked",
+]
 
 
 def normalize_symbol(symbol: str) -> str:
-    symbol = symbol.strip().upper()
+    symbol = str(symbol).strip().upper()
     return symbol if symbol.endswith(".IS") else f"{symbol}.IS"
 
 
-def init_tracking_file() -> pd.DataFrame:
-    columns = [
-        "signal_date",
-        "symbol",
-        "signal_close",
-        "phoenix_score",
-        "calibrated_probability",
-        "signal_type",
-        "day1_close_pct",
-        "day2_close_pct",
-        "day3_close_pct",
-        "max_high_pct_3d",
-        "status",
-        "last_checked",
-    ]
+def clean_symbol(symbol: str) -> str:
+    return str(symbol).strip().upper().replace(".IS", "")
 
+
+def load_tracking() -> pd.DataFrame:
     if TRACK_FILE.exists():
         df = pd.read_csv(TRACK_FILE)
-        for col in columns:
+        for col in COLUMNS:
             if col not in df.columns:
-                df[col] = None
-        return df[columns]
+                df[col] = pd.NA
+        return df[COLUMNS].copy()
+    return pd.DataFrame(columns=COLUMNS)
 
-    return pd.DataFrame(columns=columns)
+
+def save_tracking(df: pd.DataFrame) -> None:
+    df.to_csv(TRACK_FILE, index=False, encoding="utf-8-sig")
 
 
-def add_signal(
-    symbol: str,
-    signal_date: str,
-    signal_close: float,
-    phoenix_score: float,
-    calibrated_probability: float,
-    signal_type: str,
-):
-    df = init_tracking_file()
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
 
-    duplicate = (
-        (df["signal_date"].astype(str) == str(signal_date))
-        & (df["symbol"].astype(str) == str(symbol))
-    )
 
-    if duplicate.any():
-        return
+def _fetch_signal_close(symbol: str, signal_date: pd.Timestamp) -> float | None:
+    try:
+        hist = yf.download(
+            normalize_symbol(symbol),
+            start=(signal_date - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
+            end=(signal_date + pd.Timedelta(days=3)).strftime("%Y-%m-%d"),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as exc:
+        print(f"{symbol}: sinyal kapanışı indirilemedi: {exc}")
+        return None
 
-    row = {
-        "signal_date": signal_date,
-        "symbol": symbol,
-        "signal_close": signal_close,
-        "phoenix_score": phoenix_score,
-        "calibrated_probability": calibrated_probability,
-        "signal_type": signal_type,
-        "day1_close_pct": None,
-        "day2_close_pct": None,
-        "day3_close_pct": None,
-        "max_high_pct_3d": None,
-        "status": "TAKIPTE",
-        "last_checked": None,
-    }
+    if hist is None or hist.empty:
+        return None
 
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(TRACK_FILE, index=False)
+    hist = _flatten_columns(hist)
+    hist.index = pd.to_datetime(hist.index).tz_localize(None)
+    upto = hist[hist.index <= signal_date]
+    if upto.empty:
+        return None
+
+    try:
+        return float(upto.iloc[-1]["Close"])
+    except Exception:
+        return None
+
+
+def capture_latest_predictions(limit: int = 5) -> int:
+    if not PREDICTIONS_FILE.exists():
+        print("Tahmin dosyası bulunamadı; yeni aday kaydı yapılmadı.")
+        return 0
+
+    predictions = pd.read_csv(PREDICTIONS_FILE)
+    if predictions.empty:
+        print("Tahmin dosyası boş; yeni aday kaydı yapılmadı.")
+        return 0
+
+    required = {"date", "symbol"}
+    if not required.issubset(predictions.columns):
+        print(f"Tahmin dosyasında gerekli kolonlar yok: {sorted(required - set(predictions.columns))}")
+        return 0
+
+    selected = predictions.head(limit).copy()
+    tracking = load_tracking()
+    added = 0
+
+    for _, row in selected.iterrows():
+        symbol = clean_symbol(row["symbol"])
+        signal_date = pd.to_datetime(row["date"]).tz_localize(None).normalize()
+
+        duplicate = (
+            (tracking["signal_date"].astype(str) == signal_date.strftime("%Y-%m-%d"))
+            & (tracking["symbol"].astype(str).str.upper() == symbol)
+        )
+        if duplicate.any():
+            print(f"{symbol} {signal_date.date()}: zaten takipte, tekrar eklenmedi.")
+            continue
+
+        signal_close = _fetch_signal_close(symbol, signal_date)
+        if signal_close is None:
+            print(f"{symbol}: sinyal kapanışı bulunamadı, kayıt atlandı.")
+            continue
+
+        new_row = {
+            "signal_date": signal_date.strftime("%Y-%m-%d"),
+            "symbol": symbol,
+            "signal_close": round(signal_close, 6),
+            "phoenix_score": float(row.get("phoenix_score", 0.0)),
+            "calibrated_probability": float(row.get("model_probability", 0.0)),
+            "signal_type": str(row.get("signal", "")),
+            "confidence": str(row.get("confidence", "")),
+            "day1_close_pct": pd.NA,
+            "day2_close_pct": pd.NA,
+            "day3_close_pct": pd.NA,
+            "max_high_pct_3d": pd.NA,
+            "status": "TAKIPTE",
+            "last_checked": pd.NA,
+        }
+
+        tracking = pd.concat([tracking, pd.DataFrame([new_row])], ignore_index=True)
+        added += 1
+
+    save_tracking(tracking)
+    print(f"Yeni takip kaydı: {added}")
+    return added
 
 
 def _pct(value: float, base: float) -> float:
-    if base == 0:
+    if not base:
         return 0.0
-    return ((value / base) - 1.0) * 100.0
+    return ((float(value) / float(base)) - 1.0) * 100.0
 
 
-def update_tracking():
-    df = init_tracking_file()
+def update_tracking() -> pd.DataFrame:
+    tracking = load_tracking()
+    if tracking.empty:
+        save_tracking(tracking)
+        return tracking
 
-    if df.empty:
-        df.to_csv(TRACK_FILE, index=False)
-        return df
+    today = pd.Timestamp.now().normalize()
 
-    for idx, row in df.iterrows():
-
+    for idx, row in tracking.iterrows():
         if str(row.get("status", "")).upper() in {"BASARILI", "BASARISIZ"}:
             continue
 
-        symbol = str(row["symbol"])
-        signal_date = pd.to_datetime(row["signal_date"])
-        signal_close = float(row["signal_close"])
-
-        yf_symbol = normalize_symbol(symbol)
+        symbol = clean_symbol(row["symbol"])
+        signal_date = pd.to_datetime(row["signal_date"]).tz_localize(None).normalize()
+        try:
+            signal_close = float(row["signal_close"])
+        except Exception:
+            continue
 
         try:
             hist = yf.download(
-                yf_symbol,
-                start=(signal_date - pd.Timedelta(days=3)).strftime("%Y-%m-%d"),
-                end=(pd.Timestamp.today() + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+                normalize_symbol(symbol),
+                start=(signal_date - pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+                end=(today + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
                 auto_adjust=False,
                 progress=False,
                 threads=False,
             )
-        except Exception:
+        except Exception as exc:
+            print(f"{symbol}: takip verisi indirilemedi: {exc}")
             continue
 
         if hist is None or hist.empty:
             continue
 
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-
+        hist = _flatten_columns(hist)
         hist.index = pd.to_datetime(hist.index).tz_localize(None)
-
-        future = hist[hist.index > signal_date].copy()
-
+        future = hist[hist.index > signal_date].sort_index().head(3).copy()
         if future.empty:
             continue
-
-        future = future.iloc[:3]
 
         for day_number in range(1, 4):
             if len(future) >= day_number:
                 close_value = float(future.iloc[day_number - 1]["Close"])
-                df.loc[idx, f"day{day_number}_close_pct"] = round(
+                tracking.loc[idx, f"day{day_number}_close_pct"] = round(
                     _pct(close_value, signal_close), 2
                 )
 
         max_high = float(future["High"].max())
         max_high_pct = round(_pct(max_high, signal_close), 2)
-
-        df.loc[idx, "max_high_pct_3d"] = max_high_pct
-        df.loc[idx, "last_checked"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tracking.loc[idx, "max_high_pct_3d"] = max_high_pct
+        tracking.loc[idx, "last_checked"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if max_high_pct >= 9.0:
-            df.loc[idx, "status"] = "BASARILI"
+            tracking.loc[idx, "status"] = "BASARILI"
         elif len(future) >= 3:
-            df.loc[idx, "status"] = "BASARISIZ"
+            tracking.loc[idx, "status"] = "BASARISIZ"
         else:
-            df.loc[idx, "status"] = "TAKIPTE"
+            tracking.loc[idx, "status"] = "TAKIPTE"
 
-    df.to_csv(TRACK_FILE, index=False)
-    return df
+    save_tracking(tracking)
+    return tracking
 
 
 def build_tracking_summary(limit: int = 10) -> str:
-    df = update_tracking()
-
-    if df.empty:
+    tracking = load_tracking()
+    if tracking.empty:
         return "📊 PHOENIX TAKİP\nHenüz kayıtlı aday yok."
 
-    recent = df.tail(limit).copy()
-
+    recent = tracking.tail(limit).copy()
     lines = ["📊 PHOENIX ADAY TAKİP"]
 
     for _, row in recent.iterrows():
         lines.append("")
         lines.append(f"{row['symbol']} — {row['signal_date']}")
         lines.append(f"Durum: {row['status']}")
-
         if pd.notna(row["day1_close_pct"]):
             lines.append(f"1. gün kapanış: %{float(row['day1_close_pct']):+.2f}")
-
         if pd.notna(row["day2_close_pct"]):
             lines.append(f"2. gün kapanış: %{float(row['day2_close_pct']):+.2f}")
-
         if pd.notna(row["day3_close_pct"]):
             lines.append(f"3. gün kapanış: %{float(row['day3_close_pct']):+.2f}")
-
         if pd.notna(row["max_high_pct_3d"]):
             lines.append(f"3 günlük maksimum: %{float(row['max_high_pct_3d']):+.2f}")
 
     return "\n".join(lines)
 
 
+def send_telegram(message: str) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("Telegram bilgileri yok; takip özeti sadece loga yazıldı.")
+        return
+
+    for i in range(0, len(message), 3500):
+        chunk = message[i:i + 3500]
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": chunk},
+            timeout=30,
+        )
+        if not response.ok:
+            print(f"Telegram takip özeti gönderilemedi: {response.status_code} {response.text}")
+
+
+def main() -> None:
+    update_tracking()
+    capture_latest_predictions(limit=5)
+    summary = build_tracking_summary(limit=10)
+    print(summary)
+    if not load_tracking().empty:
+        send_telegram(summary)
+    print(f"Takip dosyası: {TRACK_FILE}")
+
+
 if __name__ == "__main__":
-    result = update_tracking()
-    print(build_tracking_summary())
+    main()
