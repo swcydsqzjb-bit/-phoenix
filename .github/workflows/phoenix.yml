@@ -8,6 +8,7 @@ on:
         required: true
         default: true
         type: boolean
+
       refresh:
         description: "Fiyat verisini yenile"
         required: true
@@ -17,8 +18,10 @@ on:
   schedule:
     - cron: "30 15 * * 1-5"
 
+
 permissions:
-  contents: read
+  contents: write
+
 
 jobs:
   phoenix:
@@ -26,7 +29,7 @@ jobs:
     timeout-minutes: 330
 
     steps:
-      - name: Repository dosyalarını al
+      - name: Repository dosyalarini al
         uses: actions/checkout@v4
 
       - name: Python kur
@@ -35,7 +38,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: PHOENIX önbelleğini geri yükle
+      - name: PHOENIX onbellegini geri yukle
         uses: actions/cache@v4
         with:
           path: |
@@ -46,10 +49,10 @@ jobs:
           restore-keys: |
             phoenix-${{ runner.os }}-
 
-      - name: Gerekli paketleri yükle
+      - name: Gerekli paketleri yukle
         run: pip install -r requirements.txt
 
-      - name: Çalıştırma seçeneklerini belirle
+      - name: Calistirma seceneklerini belirle
         id: flags
         shell: bash
         run: |
@@ -69,19 +72,38 @@ jobs:
 
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
-      - name: PHOENIX sistemini çalıştır
+      - name: PHOENIX sistemini calistir
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python phoenix_research.py ${{ steps.flags.outputs.flags }}
 
-      - name: PHOENIX adaylarını kaydet ve takip et
+      - name: PHOENIX adaylarini kaydet ve takip et
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python phoenix_tracker.py
 
-      - name: Sonuç dosyalarını sakla
+      - name: PHOENIX takip hafizasini kaydet
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -f phoenix_tracking.csv ]; then
+            git add phoenix_tracking.csv
+
+            if git diff --cached --quiet; then
+              echo "Takip dosyasinda yeni degisiklik yok."
+            else
+              git commit -m "Update PHOENIX tracking"
+              git push
+            fi
+          else
+            echo "phoenix_tracking.csv bulunamadi."
+          fi
+
+      - name: Sonuc dosyalarini sakla
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -92,4 +114,4 @@ jobs:
             phoenix_research_predictions.csv
             phoenix_research_metrics.json
             phoenix_research_training.csv
-            phoenix_tracking.csv 
+            phoenix_tracking.csv
